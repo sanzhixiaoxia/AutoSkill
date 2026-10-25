@@ -2,7 +2,7 @@
 name: AutoSkill
 slug: autoskill
 displayName: AutoSkill 自动加载技能
-version: 1.0.0
+version: 1.1.0
 summary: 只装这一个技能就够：自动分析对话意图，分层检索（本地优先、网上补足）并加载执行合适的能力，缺的能力先展示来源/版本/下载地址、经确认后安全安装。
 license: MIT
 description: >-
