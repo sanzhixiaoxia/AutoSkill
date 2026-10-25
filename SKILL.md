@@ -1,7 +1,9 @@
 ---
 name: AutoSkill
 description: >-
-  自动分析对话，加载需要的技能。
+  自动分析对话并加载执行所需技能。用户直接说"帮我做X"、不确定该用什么能力或技能、
+  不想在技能生态里挑拣时使用；每次请求自动判断要不要动用专门能力，本地已装优先、
+  网上补足，缺的能力免确认直接安装。
 compatibility: 依赖宿主提供的技能加载能力与"当前可用能力清单"注入；分层检索、噪声过滤与非交互安装依赖宿主已配置的能力发现入口（本环境为 extension-finder 脚本）与 python3。
 ---
 
@@ -43,6 +45,8 @@ compatibility: 依赖宿主提供的技能加载能力与"当前可用能力清�
 ```bash
 python3 scripts/search_skill_platform.py --query "<检索词1>" --query "<检索词2>"
 ```
+
+（宿主没有 `python3` 命令时——如 Windows——用 `python`。）
 
 返回中的 `active_layer` 指明这次实际命中的是哪一层。排序只是提示，**以语义是否真的对口为准**从中挑最匹配的一条，不要盲取第一条；确实没有对口的就按第六节走退路。候选详情（`slug`、`downloadURL`、`version`、`source` 等）**原样使用脚本返回的字符串**，不改写、不翻译。
 
@@ -106,7 +110,7 @@ python3 scripts/search_skill_platform.py enable  --slug <slug>          # 已下
 
 `scripts/search_skill_platform.py` 是三步与安装的统一入口，行为如下：
 
-- **分层降级（`search`）**：按 `local_installed`（离线扫描本机已装 skill / 套件——最快，不依赖网络与检索入口，本地命中时不触网）→ `quality_platform`（优质平台 / skill 技能平台）→ `other_remote`（其他远端来源，如技能广场）→ `generic_tools`（以上都没有时交通用工具）逐层尝试，**命中即停**。返回的 `active_layer` / `fallback_level` / `layers` 如实记录每层状态（`hit` / `empty` / `error` / `fallback`、原始条数、过滤与保留数、错误）。
+- **分层降级（`search`）**：按 `local_installed`（离线扫描本机已装 skill / 套件——最快，不依赖网络与检索入口，本地命中时不触网）→ `quality_platform`（优质平台 / skill 技能平台）→ `other_remote`（其他远端来源，如技能广场）→ `generic_tools`（以上都没有时交通用工具）逐层尝试，**命中即停**。**本地层的对口判定比远端严**（整词命中或 ≥2 个实词重合才算），避免弱相关的已装条目挡住更对口的远端能力。返回的 `active_layer` / `fallback_level` / `layers` 如实记录每层状态（`hit` / `empty` / `error` / `fallback`、原始条数、过滤与保留数、错误）。
 - **噪声过滤（默认开启）**：剔除无信息量条目（纯数字/纯符号/占位或测试名、无意义短名），以及只靠"生成""工具""设计"等填充泛词蹭到、并不对口的弱相关条目；过滤数量在 `filter` 字段（`raw` / `junk_dropped` / `irrelevant_dropped` / `kept`）如实报告。需要查看原始候选时加 `--no-filter` 关闭。
 - **安装免确认、非交互（`install` / `enable`）**：复用宿主能力发现入口执行，`stdin` 关闭、不等待任何输入、不弹窗；`--dry-run` 只打印将执行的命令；超时或失败返回非零退出码并在 `error` 字段说明。
 - **退出码**：`0` = 脚本跑通（候选可为空，此时 `active_layer` 为 `generic_tools`）；`1` = 参数错误；`2` = 所有检索层失败，或安装／启用失败、超时。

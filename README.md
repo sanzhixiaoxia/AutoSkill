@@ -25,6 +25,8 @@ python3 scripts/search_skill_platform.py install --slug <slug> --source hub --do
 python3 scripts/search_skill_platform.py enable --slug <slug>
 ```
 
+（Windows 上命令用 `python`。）
+
 输出为 sentinel 包裹的单行 JSON：`active_layer` 指明命中的层，`candidates[].install_hint` 是现成安装参数，`layers` / `filter` / `errors` 如实记录各层与过滤情况。候选排序只是提示，以语义对口为准。
 
 退出码：`0` 跑通（候选可为空，落到通用兜底）；`1` 参数错误；`2` 检索全失败或安装失败/超时。
@@ -36,3 +38,4 @@ python3 scripts/search_skill_platform.py enable --slug <slug>
 | `SKILL.md` | 技能主文件：路由流程、决策规则 |
 | `references/routing-playbook.md` | 易混场景判定、组合编排、降级细则（拿不准时查） |
 | `scripts/search_skill_platform.py` | 分层检索、过滤与非交互安装的统一入口 |
+| `tests/test_search_skill_platform.py` | 回归测试：`python -m unittest discover -s tests` |

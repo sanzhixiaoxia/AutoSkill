@@ -11,6 +11,8 @@
 检索默认对候选做**噪声过滤**：剔除名称/标识无信息量（如纯数字、纯符号、占位名）的垃圾条目，
 以及只靠零星字符蹭到、并不对口的弱相关条目；过滤数量在 filter 字段如实报告。
 需要看原始候选时加 --no-filter 关闭过滤。
+本地层（local_installed）另用更严的对口判定：整词命中或 ≥2 个非填充词重合才算相关，
+避免弱相关的已装条目挡住更对口的远端能力。
 
 子命令（无交互、不弹窗）：
   search（默认）  分层检索并按匹配度择优
@@ -47,6 +49,13 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
+
+# Windows 管道常为 GBK 等本地编码：候选描述含 emoji 等无法编码的字符时降级为替换，而不是崩溃。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 # skill 技能平台（hub）的检索索引标识；与平台检索协议一致。
 HUB_INDEX = "clawHub"
@@ -238,6 +247,46 @@ def _relevant(term: str, name: str, desc: str) -> bool:
     return False
 
 
+def _distinct_tokens(term: str) -> set[str]:
+    """检索词自身的非填充词集合（汉字二字组 + 拉丁词，剔除 STOP 词表）。"""
+    bigrams, words = _term_tokens(term)
+    return {b for b in bigrams if b not in STOP_BIGRAMS} | {w for w in words if w not in STOP_WORDS}
+
+
+def _distinct_overlap(term: str, name: str, desc: str) -> set[str]:
+    """检索词与名称/描述实际重合的非填充词集合。"""
+    n = (name or "").lower()
+    d = (desc or "")[:DESC_VIEW].lower()
+    tokens = _distinct_tokens(term)
+    hits: set[str] = set()
+    for text in (n, d):
+        if text:
+            hits |= {t for t in tokens if t in text}
+    return hits
+
+
+def _relevant_strict(term: str, name: str, desc: str) -> bool:
+    """本地层更严的对口判定。
+
+    本地优先后，弱相关的已装条目会挡住更对口的远端能力（例：查“视频总结”命中本地的
+    “视频剪辑”）。本地层因此要求更实的证据：整词出现在名称/描述中，或 ≥2 个非填充词
+    重合；检索词本身只有一个非填充词（如“简历”“地图”）时，单词重合也算。
+    代价是“做份简历”这类动词+核心词的检索词可能匹配不上，此时落到远端寻找即可。
+    """
+    q = (term or "").strip().lower()
+    if not q:
+        return False
+    n = (name or "").lower()
+    d = (desc or "")[:DESC_VIEW].lower()
+    if (n and q in n) or (d and q in d):
+        return True
+    hits = _distinct_overlap(q, n, d)
+    if not hits:
+        # 极短 / 纯符号词：退回字符包含判断（与宽松判定一致）
+        return any(ch in n + d for ch in q)
+    return len(hits) >= 2 or len(_distinct_tokens(q)) <= 1
+
+
 def score_candidate(terms: list[str], name: str, description: str) -> tuple[float, list[str]]:
     name = name or ""
     description = description or ""
@@ -291,11 +340,16 @@ def is_junk(name: str, slug: str, description: str) -> bool:
     return False
 
 
-def filter_and_score(items: list[dict], queries: list[str], *, do_filter: bool) -> tuple[list[dict], int, int]:
-    """对候选做噪声过滤 + 相关性判定 + 打分，返回 (保留项, 垃圾数, 弱相关数)。"""
+def filter_and_score(items: list[dict], queries: list[str], *, do_filter: bool,
+                     strict: bool = False) -> tuple[list[dict], int, int]:
+    """对候选做噪声过滤 + 相关性判定 + 打分，返回 (保留项, 垃圾数, 弱相关数)。
+
+    strict=True 用更严的本地层对口判定（_relevant_strict），见其 docstring。
+    """
     kept: list[dict] = []
     dropped_junk = 0
     dropped_irrelevant = 0
+    judge = _relevant_strict if strict else _relevant
     for item in items:
         name = item.get("name") or ""
         slug = item.get("slug") or ""
@@ -304,7 +358,7 @@ def filter_and_score(items: list[dict], queries: list[str], *, do_filter: bool) 
             dropped_junk += 1
             continue
         score, matched = score_candidate(queries, name, desc)
-        strong = [t for t in queries if _relevant(t, name, desc)]
+        strong = [t for t in queries if judge(t, name, desc)]
         if do_filter and not strong:
             dropped_irrelevant += 1
             continue
@@ -437,10 +491,20 @@ def _read_frontmatter(path: Path) -> dict:
         elif key and line[0] in " \t":
             data[key] = (data.get(key, "") + " " + line.strip()).strip()
     for k, v in list(data.items()):
-        if v in (">-", ">", "|", "|-", "|+"):
-            v = ""
+        v = v.strip()
+        for marker in (">-", ">", "|-", "|+", "|"):
+            if v.startswith(marker):
+                v = v[len(marker):].strip()
+                break
         data[k] = v.strip().strip('"').strip("'")
     return data
+
+
+def _resolve_quiet(path: Path) -> str:
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path)
 
 
 def scan_local_layer() -> tuple[list[dict], dict]:
@@ -448,15 +512,28 @@ def scan_local_layer() -> tuple[list[dict], dict]:
     items: list[dict] = []
     errors: dict[str, str] = {}
     seen: set[str] = set()
+    self_dir = _resolve_quiet(SKILL_DIR)
 
     for root in _skills_roots():
         if not root.is_dir():
             continue
-        for tier in sorted(p for p in root.iterdir() if p.is_dir()):
-            for skill_dir in sorted(p for p in tier.iterdir() if p.is_dir()):
+        try:
+            tiers = sorted(p for p in root.iterdir() if p.is_dir())
+        except OSError as exc:
+            errors[f"skills:{root}"] = str(exc)
+            continue
+        for tier in tiers:
+            try:
+                skill_dirs = sorted(p for p in tier.iterdir() if p.is_dir())
+            except OSError as exc:
+                errors[f"skills:{tier}"] = str(exc)
+                continue
+            for skill_dir in skill_dirs:
                 md = skill_dir / "SKILL.md"
                 if not md.is_file():
                     continue
+                if _resolve_quiet(skill_dir) == self_dir:
+                    continue  # 不把 AutoSkill 自己列为候选
                 slug = skill_dir.name
                 if slug in seen:
                     continue
@@ -534,8 +611,9 @@ def run_search(queries: list[str], *, limit: int, top: int, do_filter: bool) -> 
         "ok": False,
     }
 
-    def record_layer(name: str, *, status: str, items: list[dict], errors: dict, ok_jobs: int) -> bool:
-        kept, dj, di = filter_and_score(items, queries, do_filter=do_filter)
+    def record_layer(name: str, *, status: str, items: list[dict], errors: dict,
+                     strict: bool = False) -> bool:
+        kept, dj, di = filter_and_score(items, queries, do_filter=do_filter, strict=strict)
         result["filter"]["raw"] += len(items)
         result["filter"]["junk_dropped"] += dj
         result["filter"]["irrelevant_dropped"] += di
@@ -561,10 +639,10 @@ def run_search(queries: list[str], *, limit: int, top: int, do_filter: bool) -> 
         result["layers"].append(entry)
         return bool(kept)
 
-    # 第 1 层：已装本地能力（离线扫描——最快，不依赖网络与检索入口）
+    # 第 1 层：已装本地能力（离线扫描——最快，不依赖网络与检索入口；对口判定比远端严）
     items, errors = scan_local_layer()
     log(f"layer={LAYER_LOCAL} raw={len(items)} errors={len(errors)}")
-    if record_layer(LAYER_LOCAL, status="ok", items=items, errors=errors, ok_jobs=1):
+    if record_layer(LAYER_LOCAL, status="ok", items=items, errors=errors, strict=True):
         return _finalize(result)
 
     # 本地未命中，才加载远端检索入口（本地优先：本地命中时不触网、不加载入口）
@@ -594,7 +672,7 @@ def run_search(queries: list[str], *, limit: int, top: int, do_filter: bool) -> 
             limit=limit)
         status = "ok" if ok_jobs > 0 else ("error" if errors else "ok")
         log(f"layer={LAYER_QUALITY} raw={len(items)} errors={len(errors)}")
-        if record_layer(LAYER_QUALITY, status=status, items=items, errors=errors, ok_jobs=ok_jobs):
+        if record_layer(LAYER_QUALITY, status=status, items=items, errors=errors):
             return _finalize(result)
 
     # 第 3 层：其他远端（广场 skill + 广场/插件来源）
@@ -614,7 +692,7 @@ def run_search(queries: list[str], *, limit: int, top: int, do_filter: bool) -> 
             finder, queries, runtime=runtime, sources=sources, limit=limit)
         status = "ok" if ok_jobs > 0 else ("error" if errors else "ok")
         log(f"layer={LAYER_REMOTE} raw={len(items)} errors={len(errors)}")
-        if record_layer(LAYER_REMOTE, status=status, items=items, errors=errors, ok_jobs=ok_jobs):
+        if record_layer(LAYER_REMOTE, status=status, items=items, errors=errors):
             return _finalize(result)
 
     # 第 4 层：通用工具兜底（无候选，交由模型用通用工具）
@@ -814,9 +892,7 @@ def _search_main(argv: list[str]) -> int:
     print(json.dumps(result, ensure_ascii=False))
     print(SENTINEL_END)
 
-    if result["errors"].get("finder") and result["active_layer"] == LAYER_GENERIC and not result["candidates"]:
-        # 入口缺失 + 本地无匹配：仍然跑通到通用兜底，但如实返回 0（调用方可看 errors/active_layer）。
-        return 0
+    # 通用兜底也算跑通：入口缺失 / 无匹配等情况都如实体现在 errors 与 active_layer 里。
     return 0
 
 
