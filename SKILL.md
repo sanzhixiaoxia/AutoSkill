@@ -2,7 +2,7 @@
 name: AutoSkill
 slug: autoskill
 displayName: AutoSkill 自动加载技能
-version: 1.1.0
+version: 1.1.1
 summary: 只装这一个技能就够：自动分析对话意图，分层检索（本地优先、网上补足）并加载执行合适的能力，缺的能力先展示来源/版本/下载地址、经确认后安全安装。
 license: MIT
 description: >-
@@ -127,7 +127,7 @@ python3 scripts/search_skill_platform.py install --slug travel-cn --source skill
 
 `scripts/search_skill_platform.py` 是三步与安装的统一入口，行为如下：
 
-- **分层降级（`search`）**：按 `local_installed`（离线扫描本机已装 skill / 套件——最快，不依赖网络与检索入口，本地命中时不触网）→ `quality_platform`（优质平台 / skill 技能平台）→ `other_remote`（其他远端来源，如技能广场）→ `skillhub`（SkillHub 开放社区：免鉴权 HTTP 检索 `api.skillhub.cn`，**不依赖宿主检索入口**，经 `skillhub` CLI 安装）→ `generic_tools`（以上都没有时交通用工具）逐层尝试，**命中即停**。**本地层的对口判定比远端严**（整词命中或 ≥2 个实词重合才算），避免弱相关的已装条目挡住更对口的远端能力。返回的 `active_layer` / `fallback_level` / `layers` 如实记录每层状态（`hit` / `empty` / `error` / `fallback`、原始条数、过滤与保留数、错误）。
+- **分层降级（`search`）**：按 `local_installed`（离线扫描本机已装 skill / 套件——最快，不依赖网络与检索入口，本地命中时不触网）→ `quality_platform`（优质平台 / skill 技能平台）→ `other_remote`（其他远端来源，如技能广场）→ `skillhub`（SkillHub 开放社区：免鉴权 HTTP 检索 `api.skillhub.cn`，**不依赖宿主检索入口**，经 `skillhub` CLI 安装）→ `generic_tools`（以上都没有时交通用工具）逐层尝试，**命中即停**。**本地层的对口判定比远端严**（整词命中或 ≥2 个实词重合才算），避免弱相关的已装条目挡住更对口的远端能力。返回的 `active_layer` / `fallback_level` / `layers` 如实记录每层状态（`hit` / `empty` / `error` / `fallback`、原始条数、过滤与保留数、错误）。**本地未命中时，顶层附 `near_miss`（最多 3 条）**：宽松相关但严判定不过的已装候选——词法证据弱不等于不对口（如"自动加载技能"里有效词只剩"加载"），其中语义明显对口的**直接采用，无需降级远端**。
 - **噪声过滤（默认开启）**：剔除无信息量条目（纯数字/纯符号/占位或测试名、无意义短名），以及只靠"生成""工具""设计"等填充泛词蹭到、并不对口的弱相关条目；过滤数量在 `filter` 字段（`raw` / `junk_dropped` / `irrelevant_dropped` / `kept`）如实报告。需要查看原始候选时加 `--no-filter` 关闭。
 - **安装/启用先确认（`install` / `enable`）**：默认只做**策略校验 + 预览**（不执行），返回 `confirm`（来源、版本、下载地址、将执行的命令）供向用户展示；加 `--yes` 才真正执行（子进程仍 `stdin` 关闭、不弹窗）。策略校验含：下载地址域名白名单（https，`SKILL_INSTALL_ALLOWED_HOSTS` 可整体替换）、版本固定（缺失需 `--allow-unpinned`）、哈希校验（`--sha256` 先下载校验再以本地文件安装；无哈希需 `--allow-no-hash`）；`--force` 仅随 `--yes` 生效；`enable` 对台账外候选要求 `--user-confirmed`。**SkillHub 候选**（`--source skillhub`）改经 `skillhub` CLI 安装到技能目录（`--dir` 或 `SKILLHUB_INSTALL_DIR`，默认自动探测），下载与完整性由 CLI 官方源管理，不强制 URL/版本/哈希三项，但同样先预览后确认。安装成功记入安装台账（`scripts/.install-ledger.json`）。调用契约与审计入口见 `references/installer-contract.md`。
 - **退出码**：`0` = 脚本跑通（候选可为空，此时 `active_layer` 为 `generic_tools`；安装预览也算跑通）；`1` = 参数错误；`2` = 所有检索层失败，或安装／启用被策略拦下、失败、超时。

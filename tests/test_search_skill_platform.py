@@ -190,6 +190,19 @@ class LocalLayerTests(EnvFixture):
         self.assertEqual(result["active_layer"], self.m.LAYER_GENERIC)
         self.assertIn("finder", result["errors"])
 
+    def test_local_near_miss_reported(self):
+        # "自动加载技能"里"自动/技能"是停用词，本地 autoskill 只重合"加载"被严判定
+        # 拦下，但应作为 near_miss 返回，供模型按语义采用（不丢信息）。
+        d = self.root / "autoskill"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "SKILL.md").write_text(
+            "---\nname: AutoSkill\ndescription: 自动分析对话并加载执行所需技能，本地已装优先\n---\n", encoding="utf-8")
+        self.m.collect_skillhub_layer = lambda queries, *, limit: ([], {})
+        result = self.m.run_search(["自动加载技能"], limit=5, top=5, do_filter=True)
+        self.assertEqual(result["layers"][0]["status"], "empty")
+        self.assertEqual(result["near_miss"][0]["slug"], "autoskill")
+        self.assertIn("加载", result["near_miss"][0]["description"])
+
 
 class CliFixture(unittest.TestCase):
     """通过 main() 跑 install/enable 子命令并捕获 JSON 输出。"""

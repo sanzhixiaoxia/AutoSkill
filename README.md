@@ -35,7 +35,7 @@ python3 scripts/search_skill_platform.py install --slug <slug> --source skillhub
 
 （Windows 上命令用 `python`。）
 
-输出为 sentinel 包裹的单行 JSON：`active_layer` 指明命中的层，`candidates[].install_hint` 是现成安装参数，`layers` / `filter` / `errors` 如实记录各层与过滤情况。候选排序只是提示，以语义对口为准。
+输出为 sentinel 包裹的单行 JSON：`active_layer` 指明命中的层，`candidates[].install_hint` 是现成安装参数，`layers` / `filter` / `errors` 如实记录各层与过滤情况；本地未命中时附 `near_miss`（弱词法相关的已装候选，语义对口可直接采用）。候选排序只是提示，以语义对口为准。
 
 退出码：`0` 跑通（候选可为空或安装仅预览）；`1` 参数错误；`2` 检索全失败，或安装/启用被策略拦下、失败、超时。
 

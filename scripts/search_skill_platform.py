@@ -756,6 +756,22 @@ def run_search(queries: list[str], *, limit: int, top: int, do_filter: bool) -> 
     log(f"layer={LAYER_LOCAL} raw={len(items)} errors={len(errors)}")
     if record_layer(LAYER_LOCAL, status="ok", items=items, errors=errors, strict=True):
         return _finalize(result)
+    if items:
+        # 本地未命中时的"差一点"名单：宽松相关但严判定不过的已装候选。
+        # 词法证据弱不等于不对口（如"自动加载技能"里有效词只剩"加载"），
+        # 交给模型按语义决断：near_miss 里有明显对口的，直接采用，无需降级远端。
+        near = []
+        for it in items:
+            if is_junk(it.get("name") or "", it.get("slug") or "", it.get("description") or ""):
+                continue
+            name, desc = it.get("name") or "", it.get("description") or ""
+            if any(_relevant(t, name, desc) for t in queries):
+                score, _ = score_candidate(queries, name, desc)
+                near.append({k: it.get(k) for k in ("slug", "name", "description", "version", "source", "install_hint")}
+                            | {"score": score, "reason": "本地已装，词法证据弱（near_miss）"})
+        near.sort(key=lambda x: -x["score"])
+        if near:
+            result["near_miss"] = near[:3]
 
     # 本地未命中，才加载远端检索入口（本地优先：本地命中时不触网、不加载入口）
     finder_path = locate_finder()
