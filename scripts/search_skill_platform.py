@@ -6,7 +6,8 @@
   1. 已装本地  local_installed    —— 本机已安装的 skill / 套件（离线扫描，最快且不依赖网络）
   2. 优质平台  quality_platform   —— skill 技能平台（skill hub）
   3. 其他远端  other_remote       —— 技能广场（square）等远端来源
-  4. 通用工具  generic_tools      —— 以上都没有时，交给通用工具兜底
+  4. 开放社区  skillhub           —— SkillHub（api.skillhub.cn，免鉴权；不依赖宿主检索入口）
+  5. 通用工具  generic_tools      —— 以上都没有时，交给通用工具兜底
 
 检索默认对候选做**噪声过滤**：剔除名称/标识无信息量（如纯数字、纯符号、占位名）的垃圾条目，
 以及只靠零星字符蹭到、并不对口的弱相关条目；过滤数量在 filter 字段如实报告。
@@ -14,17 +15,23 @@
 本地层（local_installed）另用更严的对口判定：整词命中或 ≥2 个非填充词重合才算相关，
 避免弱相关的已装条目挡住更对口的远端能力。
 
-子命令（无交互、不弹窗）：
+子命令（子进程层面无交互：stdin 关闭、不弹窗；安装/启用在对话层需用户确认，默认只预览）：
   search（默认）  分层检索并按匹配度择优
-  install         非交互安装候选（复用宿主能力发现入口的 install；stdin 关闭，绝不等待输入）
-  enable          非交互启用已下载但被禁用的候选
+  install         安装候选：默认只做策略校验 + 预览（域名白名单 / 版本固定 / 哈希校验），
+                  返回 confirm（来源、版本、下载地址、将执行的命令）供向用户展示；
+                  用户明确同意后加 --yes 才真正执行
+  enable          启用已下载但被禁用的候选：默认预览；非本流程安装（台账外）的候选
+                  需额外 --user-confirmed，避免覆盖用户此前的禁用决定
 
 用法：
   python3 scripts/search_skill_platform.py \
       --query "整理会议记录" --query "会议纪要" [--limit 5] [--top 5] [--no-filter]
-  python3 scripts/search_skill_platform.py install --slug <slug> --source hub --download-url <url>
-  python3 scripts/search_skill_platform.py install --type plugin --plugin-code <code>
-  python3 scripts/search_skill_platform.py install --slug <slug> --source hub --dry-run   # 只打印将要执行的命令
+  python3 scripts/search_skill_platform.py install --slug <slug> --source hub \
+      --download-url <url> --version <v> [--sha256 <hex>]        # 预览 + 策略校验
+  python3 scripts/search_skill_platform.py install --slug <slug> --source hub \
+      --download-url <url> --version <v> --yes                   # 用户确认后执行
+  python3 scripts/search_skill_platform.py install --type plugin --plugin-code <code> --yes
+  python3 scripts/search_skill_platform.py enable --slug <slug> --yes [--user-confirmed]
 
 输出：sentinel 包裹的单行 JSON，便于宿主解析：
 
@@ -32,19 +39,26 @@
   {"query":[...],"active_layer":"...","fallback_level":1,"candidates":[...],...}
   ===END===
 
-退出码：0=脚本跑通（候选可能为空，此时 active_layer 为 generic_tools）；
-1=参数错误或子命令用法错误；2=所有检索层都失败（不再伪装成“平台没有匹配”）。
+退出码：0=脚本跑通（候选可能为空，此时 active_layer 为 generic_tools；安装预览也算跑通）；
+1=参数错误或子命令用法错误；2=所有检索层都失败，或安装/启用被策略拦下、失败、超时。
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -63,6 +77,18 @@ HUB_INDEX = "clawHub"
 SQUARE_INDEX_PERSONAL = "baiduMate"
 SQUARE_INDEX_ENTERPRISE = "enterprise"
 
+# skill 下载地址域名白名单（https，子域后缀匹配）。环境变量 SKILL_INSTALL_ALLOWED_HOSTS
+# 可整体替换（逗号分隔）。策略细节见 references/installer-contract.md。
+DEFAULT_ALLOWED_HOSTS = (
+    "bcebos.com",  # 百度对象存储（skill hub 分发域）
+    "github.com",
+    "raw.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "codeload.github.com",
+)
+# 安装台账：记录经本流程安装的候选；enable 据此区分"本流程装的"与"用户可能有意禁用的"。
+LEDGER_PATH = Path(__file__).resolve().parent / ".install-ledger.json"
+
 SENTINEL_BEGIN = "===SKILL_PLATFORM_CANDIDATES==="
 SENTINEL_END = "===END==="
 
@@ -73,20 +99,27 @@ DESC_VIEW = 2000
 
 LAYER_QUALITY = "quality_platform"
 LAYER_REMOTE = "other_remote"
+LAYER_SKILLHUB = "skillhub"
 LAYER_LOCAL = "local_installed"
 LAYER_GENERIC = "generic_tools"
+
+# SkillHub 开放技能社区：免鉴权 HTTP 检索 + skillhub CLI 安装（契约见 references/installer-contract.md）。
+SKILLHUB_API = "https://api.skillhub.cn/api/skills"
+SKILLHUB_TIMEOUT = 8
 
 LAYER_LABELS = {
     LAYER_LOCAL: "已装本地能力",
     LAYER_QUALITY: "优质平台（skill 技能平台 / hub）",
     LAYER_REMOTE: "其他远端来源（技能广场等）",
+    LAYER_SKILLHUB: "SkillHub 开放社区（免鉴权）",
     LAYER_GENERIC: "通用工具兜底",
 }
 FALLBACK_LEVEL = {
     LAYER_LOCAL: 1,
     LAYER_QUALITY: 2,
     LAYER_REMOTE: 3,
-    LAYER_GENERIC: 4,
+    LAYER_SKILLHUB: 4,
+    LAYER_GENERIC: 5,
 }
 
 
@@ -118,7 +151,8 @@ def _finder_candidates() -> list[Path]:
         for tier in ("official", "user"):
             cands.append(root / tier / rel)
         try:
-            cands.extend(sorted(root.glob(f"*/{rel}")))
+            cands.extend(sorted(root.glob(f"*/{rel}")))  # skills/<tier>/<skill> 分层布局
+            cands.append(root / rel)                     # skills/<skill> 扁平布局（宿主 global/data/skills 实际如此）
         except OSError:
             pass
     return cands
@@ -280,11 +314,14 @@ def _relevant_strict(term: str, name: str, desc: str) -> bool:
     d = (desc or "")[:DESC_VIEW].lower()
     if (n and q in n) or (d and q in d):
         return True
+    tokens = _distinct_tokens(q)
+    if not tokens:
+        # 极短 / 纯符号词（无可拆词）：退回字符包含判断（与宽松判定一致）
+        return any(ch in n + d for ch in q)
     hits = _distinct_overlap(q, n, d)
     if not hits:
-        # 极短 / 纯符号词：退回字符包含判断（与宽松判定一致）
-        return any(ch in n + d for ch in q)
-    return len(hits) >= 2 or len(_distinct_tokens(q)) <= 1
+        return False
+    return len(hits) >= 2 or len(tokens) <= 1
 
 
 def score_candidate(terms: list[str], name: str, description: str) -> tuple[float, list[str]]:
@@ -387,6 +424,8 @@ def norm_remote(item: dict, *, source: str, kind: str) -> dict | None:
         hint = f"install --slug {slug} --source {src}"
         if download:
             hint += f" --download-url {download}"
+        if version:
+            hint += f" --version {version}"
     return {
         "slug": slug,
         "name": str(item.get("displayName") or item.get("name") or slug),
@@ -442,6 +481,73 @@ def collect_remote_layer(finder, queries: list[str], *, runtime: str, sources: l
                     continue
                 merged.setdefault((kind, norm["slug"]), norm)
     return list(merged.values()), errors, ok_jobs
+
+
+# ── SkillHub 开放社区（免鉴权 HTTP，不依赖宿主检索入口）──────────────────
+
+def _skillhub_search_one(term: str, limit: int) -> list[dict]:
+    url = f"{SKILLHUB_API}?keyword={urllib.parse.quote(term)}&sortBy=score&pageSize={max(1, limit)}"
+    req = urllib.request.Request(url, headers={"User-Agent": "AutoSkill/1.0"})
+    with urllib.request.urlopen(req, timeout=SKILLHUB_TIMEOUT) as resp:  # noqa: S310 固定 https 官方域
+        body = json.loads(resp.read().decode("utf-8"))
+    items = ((body.get("data") or {}).get("skills")) or []
+    return [x for x in items if isinstance(x, dict)]
+
+
+def norm_skillhub(item: dict) -> dict | None:
+    slug = str(item.get("slug") or "").strip()
+    if not slug:
+        return None
+    ns = str(item.get("ownerName") or "").strip()
+    version = item.get("version")
+    hint = f"install --slug {slug} --source skillhub"
+    if ns:
+        hint += f" --namespace {ns}"
+    return {
+        "slug": slug,
+        "name": str(item.get("name") or slug),
+        "description": str(item.get("description_zh") or item.get("description") or ""),
+        "version": str(version) if version else None,
+        "downloadURL": None,
+        "skillId": None,
+        "versionId": None,
+        "source": "skillhub",
+        "kind": "skill",
+        "owner": ns or None,
+        "downloads": item.get("downloads"),
+        "install_hint": hint,
+    }
+
+
+def collect_skillhub_layer(queries: list[str], *, limit: int) -> tuple[list[dict], dict]:
+    """并发查询 SkillHub（每个检索词一次），合并按 slug 去重。返回 (归一候选, errors)。"""
+    errors: dict[str, str] = {}
+    merged: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(queries)))) as pool:
+        futures = {pool.submit(_skillhub_search_one, t, limit): t for t in queries}
+        for fut, term in futures.items():
+            try:
+                items = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                errors[f"skillhub:{term}"] = f"{type(exc).__name__}: {exc}"
+                continue
+            for item in items:
+                norm = norm_skillhub(item)
+                if norm:
+                    merged.setdefault(norm["slug"], norm)
+    return list(merged.values()), errors
+
+
+def _skillhub_install_dir() -> str | None:
+    """SkillHub 安装目标目录：环境变量 > 已知技能根 > ~/.zcode/skills。"""
+    env = os.environ.get("SKILLHUB_INSTALL_DIR", "").strip()
+    if env:
+        return env
+    for root in _skills_roots():
+        if root.is_dir():
+            return str(root)
+    zcode = Path.home() / ".zcode" / "skills"
+    return str(zcode) if zcode.is_dir() else None
 
 
 # ── 本地已装能力（离线扫描）──────────────────────────────────────────────
@@ -518,39 +624,45 @@ def scan_local_layer() -> tuple[list[dict], dict]:
         if not root.is_dir():
             continue
         try:
-            tiers = sorted(p for p in root.iterdir() if p.is_dir())
+            children = sorted(p for p in root.iterdir() if p.is_dir())
         except OSError as exc:
             errors[f"skills:{root}"] = str(exc)
             continue
-        for tier in tiers:
-            try:
-                skill_dirs = sorted(p for p in tier.iterdir() if p.is_dir())
-            except OSError as exc:
-                errors[f"skills:{tier}"] = str(exc)
+        # 兼容两种布局：skills/<skill>（扁平，宿主 global/data/skills 实际如此）与
+        # skills/<tier>/<skill>（official/user 分层）。子目录自带 SKILL.md 即技能；
+        # 否则视为 tier 再向下一层。
+        skill_dirs: list[Path] = []
+        for child in children:
+            if (child / "SKILL.md").is_file():
+                skill_dirs.append(child)
+            else:
+                try:
+                    skill_dirs.extend(sorted(p for p in child.iterdir() if p.is_dir()))
+                except OSError as exc:
+                    errors[f"skills:{child}"] = str(exc)
+        for skill_dir in skill_dirs:
+            md = skill_dir / "SKILL.md"
+            if not md.is_file():
                 continue
-            for skill_dir in skill_dirs:
-                md = skill_dir / "SKILL.md"
-                if not md.is_file():
-                    continue
-                if _resolve_quiet(skill_dir) == self_dir:
-                    continue  # 不把 AutoSkill 自己列为候选
-                slug = skill_dir.name
-                if slug in seen:
-                    continue
-                seen.add(slug)
-                fm = _read_frontmatter(md)
-                items.append({
-                    "slug": slug,
-                    "name": fm.get("name") or slug,
-                    "description": fm.get("description") or "",
-                    "version": fm.get("version"),
-                    "downloadURL": None,
-                    "skillId": None,
-                    "versionId": None,
-                    "source": "local",
-                    "kind": "skill",
-                    "install_hint": f"use 已装技能 {slug}（无需安装）",
-                })
+            if _resolve_quiet(skill_dir) == self_dir:
+                continue  # 不把 AutoSkill 自己列为候选
+            slug = skill_dir.name
+            if slug in seen:
+                continue
+            seen.add(slug)
+            fm = _read_frontmatter(md)
+            items.append({
+                "slug": slug,
+                "name": fm.get("name") or slug,
+                "description": fm.get("description") or "",
+                "version": fm.get("version"),
+                "downloadURL": None,
+                "skillId": None,
+                "versionId": None,
+                "source": "local",
+                "kind": "skill",
+                "install_hint": f"use 已装技能 {slug}（无需安装）",
+            })
 
     for root in _plugins_roots():
         if not root.is_dir():
@@ -695,7 +807,15 @@ def run_search(queries: list[str], *, limit: int, top: int, do_filter: bool) -> 
         if record_layer(LAYER_REMOTE, status=status, items=items, errors=errors):
             return _finalize(result)
 
-    # 第 4 层：通用工具兜底（无候选，交由模型用通用工具）
+    # 第 4 层：SkillHub 开放社区（免鉴权 HTTP，不依赖宿主检索入口——宿主入口缺失时也能触达远端）
+    if not result["candidates"]:
+        items, errors = collect_skillhub_layer(queries, limit=limit)
+        status = "error" if len(errors) >= len(queries) else "ok"
+        log(f"layer={LAYER_SKILLHUB} raw={len(items)} errors={len(errors)}")
+        if record_layer(LAYER_SKILLHUB, status=status, items=items, errors=errors):
+            return _finalize(result)
+
+    # 第 5 层：通用工具兜底（无候选，交由模型用通用工具）
     result["layers"].append({
         "layer": LAYER_GENERIC,
         "label": LAYER_LABELS[LAYER_GENERIC],
@@ -714,7 +834,110 @@ def _finalize(result: dict) -> dict:
     return result
 
 
-# ── 子命令：install / enable（非交互）─────────────────────────────────────
+# ── 安装策略：白名单 / 版本固定 / 哈希校验 / 台账 ─────────────────────────
+
+def _allowed_hosts() -> tuple[str, ...]:
+    env = os.environ.get("SKILL_INSTALL_ALLOWED_HOSTS", "").strip()
+    if env:
+        return tuple(h.strip().lower() for h in env.split(",") if h.strip())
+    return DEFAULT_ALLOWED_HOSTS
+
+
+def _host_allowed(host: str) -> bool:
+    host = (host or "").strip().lower()
+    if not host:
+        return False
+    return any(host == a or host.endswith("." + a) for a in _allowed_hosts())
+
+
+def _load_ledger(path: Path | None = None) -> dict:
+    path = path or LEDGER_PATH
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_ledger(data: dict, path: Path | None = None) -> None:
+    path = path or LEDGER_PATH
+    try:
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        log(f"安装台账写入失败: {exc}", level="warn")
+
+
+def _record_install(key: str, entry: dict, path: Path | None = None) -> None:
+    data = _load_ledger(path)
+    data[key] = entry
+    _save_ledger(data, path)
+
+
+def _fetch_and_verify(url: str, sha256: str, dest_dir: Path) -> Path:
+    """下载（https）或读取（file://）工件并校验 sha256，返回本地文件路径；校验失败抛 ValueError。"""
+    u = urllib.parse.urlparse(url)
+    if u.scheme == "file":
+        src = Path(urllib.request.url2pathname(u.path))
+        data = src.read_bytes()
+    elif u.scheme == "https":
+        with urllib.request.urlopen(url, timeout=60) as resp:  # noqa: S310 调用前已过域名白名单
+            data = resp.read()
+    else:
+        raise ValueError(f"仅支持 https:// 或 file:// 地址，当前协议: {u.scheme or '无'}")
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != (sha256 or "").strip().lower():
+        raise ValueError(f"sha256 校验失败: 期望 {sha256}，实际 {digest}")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / "verified-download.bin"
+    dest.write_bytes(data)
+    return dest
+
+
+def _install_policy(args: argparse.Namespace) -> tuple[dict, list[str]]:
+    """安装前策略校验。返回 (供用户确认的展示信息, 阻断性问题列表)。"""
+    problems: list[str] = []
+    slug = (args.plugin_code or args.slug) if args.kind == "plugin" else args.slug
+    confirm: dict = {
+        "kind": args.kind,
+        "slug": slug,
+        "source": getattr(args, "source", None),
+        "version": args.version or args.version_id or None,
+        "download_url": args.download_url,
+        "sha256": args.sha256 or None,
+        "force": bool(args.force),
+    }
+    if args.kind == "skill" and getattr(args, "source", None) == "skillhub":
+        confirm["host"] = "SkillHub CLI 解析"
+        confirm["namespace"] = (getattr(args, "namespace", None) or None)
+        # 下载与完整性由 skillhub CLI 管理（官方源），不走 finder 的 URL/版本/哈希强制项
+    elif args.kind == "skill":
+        url = args.download_url
+        if url:
+            u = urllib.parse.urlparse(url)
+            host = (u.hostname or "").lower()
+            if u.scheme == "https":
+                confirm["host"] = host or None
+                if not _host_allowed(host):
+                    problems.append(
+                        f"下载域名不在白名单: {host or '无'}（可用环境变量 SKILL_INSTALL_ALLOWED_HOSTS 配置）")
+            elif u.scheme == "file":
+                confirm["host"] = "本地文件"
+            else:
+                problems.append(f"下载地址必须为 https://（本地文件用 file://），当前协议: {u.scheme or '无'}")
+        else:
+            confirm["host"] = "由安装器解析"
+        if not (args.version or args.version_id or args.skill_id) and not args.allow_unpinned:
+            problems.append("版本未固定：请传 --version（或 --skill-id/--version-id）；用户知情同意不固定时加 --allow-unpinned")
+        if not args.sha256 and not args.allow_no_hash:
+            problems.append("未做哈希校验：平台提供哈希时传 --sha256；平台无哈希且用户知情时加 --allow-no-hash")
+    else:
+        confirm["host"] = "由插件市场解析"
+    if args.force and not args.yes:
+        confirm["force_warning"] = "--force 仅在用户确认（--yes）后生效"
+    return confirm, problems
+
+
+# ── 子命令：install / enable（预览默认，确认后执行）──────────────────────
 
 def _build_install_argv(args: argparse.Namespace) -> list[str]:
     argv = ["install", "--type", args.kind]
@@ -760,25 +983,105 @@ def _extract_finder_json(stdout: str) -> dict | None:
 
 
 def cmd_install(args: argparse.Namespace) -> int:
-    """非交互安装候选：调用宿主能力发现入口的 install，stdin 关闭，绝不等待输入。"""
+    """安装候选：默认只做策略校验与预览（不执行），用户确认（--yes）后才真正执行。"""
+    use_skillhub = getattr(args, "source", None) == "skillhub"
+    if use_skillhub and not (args.slug or "").strip():
+        _emit("install", False, error="SkillHub 安装需要 --slug", error_type="arguments")
+        return 1
     try:
-        extra = _build_install_argv(args)
+        extra = [] if use_skillhub else _build_install_argv(args)
     except ValueError as exc:
         log(str(exc), level="error")
         _emit("install", False, error=str(exc), error_type="arguments")
         return 1
 
+    confirm, problems = _install_policy(args)
+    if problems:
+        _emit("install", False, error="; ".join(problems), error_type="policy", confirm=confirm)
+        return 2
+
+    if use_skillhub:
+        skillhub_bin = shutil.which("skillhub")
+        install_dir = (getattr(args, "dir", None) or "").strip() or _skillhub_install_dir()
+        cli_argv = ["install", args.slug]
+        if getattr(args, "namespace", None):
+            cli_argv += ["--namespace", args.namespace]
+        if install_dir:
+            cli_argv += ["--dir", install_dir]
+        command = [skillhub_bin or "skillhub", *cli_argv]
+        if args.dry_run or not args.yes:
+            confirm["install_dir"] = install_dir
+            _emit("install", True, executed=False, dry_run=True, needs_confirmation=True,
+                  confirm=confirm, command=command)
+            return 0
+        if skillhub_bin is None:
+            _emit("install", False,
+                  error="未找到 skillhub CLI（安装方式见 references/installer-contract.md）",
+                  error_type="cli_missing")
+            return 1
+        if install_dir is None:
+            _emit("install", False,
+                  error="未确定技能安装目录：请传 --dir 或设置 SKILLHUB_INSTALL_DIR",
+                  error_type="arguments")
+            return 1
+        log(f"install（已经用户确认，经 SkillHub CLI）: {' '.join(cli_argv)}")
+        try:
+            proc = subprocess.run(
+                command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=args.timeout,
+            )
+        except subprocess.TimeoutExpired:
+            _emit("install", False, error=f"安装超时（{args.timeout}s）", error_type="timeout")
+            return 2
+        ok = proc.returncode == 0
+        if ok:
+            _record_install(args.slug, {
+                "kind": "skill",
+                "source": "skillhub",
+                "namespace": getattr(args, "namespace", None) or None,
+                "version": args.version or None,
+                "install_dir": install_dir,
+                "installed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            })
+        _emit("install", bool(ok), executed=True, exit_code=proc.returncode, command=command,
+              result=None, stderr=(proc.stderr or "").strip()[-2000:] or None)
+        return 0 if ok else 2
+
+    # 提供了 --sha256 时先下载校验，通过后以本地文件交给安装器（契约见 references/installer-contract.md）。
+    tmp_dir: tempfile.TemporaryDirectory | None = None
+    sha_mode = None
+    if args.kind == "skill" and args.sha256 and args.download_url:
+        tmp_dir = tempfile.TemporaryDirectory(prefix="autoskill_verify_")
+        try:
+            local = _fetch_and_verify(args.download_url, args.sha256, Path(tmp_dir.name))
+        except ValueError as exc:
+            tmp_dir.cleanup()
+            _emit("install", False, error=str(exc), error_type="hash", confirm=confirm)
+            return 2
+        except (urllib.error.URLError, OSError) as exc:
+            tmp_dir.cleanup()
+            _emit("install", False, error=f"下载失败: {exc}", error_type="download", confirm=confirm)
+            return 2
+        extra = [local.as_uri() if part == args.download_url else part for part in extra]
+        sha_mode = "verified_local"
+
     finder_path = locate_finder()
+    command = [sys.executable, str(finder_path) if finder_path else "<extension_finder.py>", *extra]
+
+    if args.dry_run or not args.yes:
+        confirm["sha_mode"] = sha_mode
+        _emit("install", True, executed=False, dry_run=True, needs_confirmation=True,
+              confirm=confirm, command=command)
+        if tmp_dir:
+            tmp_dir.cleanup()
+        return 0
+
     if finder_path is None:
+        if tmp_dir:
+            tmp_dir.cleanup()
         _emit("install", False, error="未找到能力发现入口（extension_finder 脚本）", error_type="finder_missing")
         return 1
 
-    command = [sys.executable, str(finder_path), *extra]
-    if args.dry_run:
-        _emit("install", True, dry_run=True, command=command)
-        return 0
-
-    log(f"install（非交互）: {' '.join(extra)}")
+    log(f"install（已经用户确认）: {' '.join(extra)}")
     try:
         proc = subprocess.run(
             command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=args.timeout,
@@ -786,11 +1089,28 @@ def cmd_install(args: argparse.Namespace) -> int:
     except subprocess.TimeoutExpired:
         _emit("install", False, error=f"安装超时（{args.timeout}s）", error_type="timeout")
         return 2
+    finally:
+        if tmp_dir:
+            tmp_dir.cleanup()
 
     summary = _extract_finder_json(proc.stdout) or {}
     ok = proc.returncode == 0 and summary.get("ok", True)
+    if ok:
+        if args.kind == "plugin":
+            key = args.plugin_code or args.slug
+        else:
+            key = args.slug
+        _record_install(key, {
+            "kind": args.kind,
+            "source": getattr(args, "source", None),
+            "version": args.version or args.version_id or None,
+            "sha256": args.sha256 or None,
+            "downloadURL": args.download_url,
+            "installed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        })
     _emit(
         "install", bool(ok),
+        executed=True,
         exit_code=proc.returncode,
         command=command,
         result=summary or None,
@@ -800,32 +1120,48 @@ def cmd_install(args: argparse.Namespace) -> int:
 
 
 def cmd_enable(args: argparse.Namespace) -> int:
-    """非交互启用已下载但被禁用的候选。"""
-    argv = ["enable", "--type", args.kind]
+    """启用候选：默认预览；台账外（可能被用户有意禁用的）候选需 --user-confirmed。"""
     if args.kind == "plugin":
-        code = args.plugin_code or args.slug
-        if not code:
+        key = args.plugin_code or args.slug
+        if not key:
             _emit("enable", False, error="插件启用需要 --plugin-code 或 --slug", error_type="arguments")
             return 1
-        argv += ["--plugin-code", code]
     else:
-        if not args.slug:
+        key = args.slug
+        if not key:
             _emit("enable", False, error="技能启用需要 --slug", error_type="arguments")
             return 1
-        argv += ["--slug", args.slug]
-    if args.force:
-        argv += ["--force"]
+
+    managed = key in _load_ledger()
+    confirm = {"kind": args.kind, "slug": key, "managed_by_this_flow": managed}
+    if not managed:
+        confirm["note"] = "该候选不是经本流程安装的，可能是用户有意禁用；重新启用需用户明确同意（--user-confirmed）"
+
+    if args.dry_run or not args.yes:
+        _emit("enable", True, executed=False, dry_run=True, needs_confirmation=True, confirm=confirm)
+        return 0
+
+    if not managed and not args.user_confirmed:
+        _emit("enable", False,
+              error="拒绝执行：该候选可能被用户有意禁用，需用户明确要求重新启用（--user-confirmed）",
+              error_type="enable_guard", confirm=confirm)
+        return 2
 
     finder_path = locate_finder()
     if finder_path is None:
         _emit("enable", False, error="未找到能力发现入口（extension_finder 脚本）", error_type="finder_missing")
         return 1
 
+    argv = ["enable", "--type", args.kind]
+    if args.kind == "plugin":
+        argv += ["--plugin-code", key]
+    else:
+        argv += ["--slug", key]
+    if args.force:
+        argv += ["--force"]
     command = [sys.executable, str(finder_path), *argv]
-    if args.dry_run:
-        _emit("enable", True, dry_run=True, command=command)
-        return 0
 
+    log(f"enable（已经用户确认）: {' '.join(argv)}")
     try:
         proc = subprocess.run(
             command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=args.timeout,
@@ -838,6 +1174,7 @@ def cmd_enable(args: argparse.Namespace) -> int:
     ok = proc.returncode == 0 and summary.get("ok", True)
     _emit(
         "enable", bool(ok),
+        executed=True,
         exit_code=proc.returncode,
         command=command,
         result=summary or None,
@@ -907,25 +1244,34 @@ def main(argv: list[str] | None = None) -> int:
         return _search_main(argv)
 
     if command == "install":
-        ap = argparse.ArgumentParser(prog="install", description="非交互安装候选（不弹窗）")
+        ap = argparse.ArgumentParser(prog="install", description="安装候选：默认只预览与策略校验，--yes 后才执行")
         ap.add_argument("--type", dest="kind", choices=["skill", "plugin"], default="skill")
         ap.add_argument("--slug")
         ap.add_argument("--plugin-code")
-        ap.add_argument("--source", choices=["square", "hub"])
+        ap.add_argument("--source", choices=["square", "hub", "skillhub"])
+        ap.add_argument("--namespace", help="SkillHub 专用：候选 ownerName（namespace）")
+        ap.add_argument("--dir", help="SkillHub 专用：技能安装目录（默认自动探测）")
         ap.add_argument("--download-url", dest="download_url")
         ap.add_argument("--version")
         ap.add_argument("--skill-id")
         ap.add_argument("--version-id")
-        ap.add_argument("--force", action="store_true")
-        ap.add_argument("--dry-run", action="store_true", help="只打印将要执行的命令，不实际安装")
+        ap.add_argument("--sha256", help="工件 sha256；提供时先下载校验，再以本地文件安装")
+        ap.add_argument("--allow-unpinned", action="store_true", help="知情豁免：安装未固定版本的候选")
+        ap.add_argument("--allow-no-hash", action="store_true", help="知情豁免：平台无哈希时不做哈希校验")
+        ap.add_argument("--force", action="store_true", help="覆盖安装（仅在 --yes 确认后生效）")
+        ap.add_argument("--yes", action="store_true", help="用户已确认，真正执行（默认只预览）")
+        ap.add_argument("--dry-run", action="store_true", help="显式预览（与默认行为相同，不实际安装）")
         ap.add_argument("--timeout", type=int, default=120, help="安装超时秒数")
         return cmd_install(ap.parse_args(argv))
 
-    ap = argparse.ArgumentParser(prog="enable", description="非交互启用已签入但被禁用的候选")
+    ap = argparse.ArgumentParser(prog="enable", description="启用候选：默认预览；台账外候选需 --user-confirmed")
     ap.add_argument("--type", dest="kind", choices=["skill", "plugin"], default="skill")
     ap.add_argument("--slug")
     ap.add_argument("--plugin-code")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--yes", action="store_true", help="用户已确认，真正执行（默认只预览）")
+    ap.add_argument("--user-confirmed", dest="user_confirmed", action="store_true",
+                    help="用户明确要求重新启用（用于台账外、可能被用户有意禁用的候选）")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--timeout", type=int, default=60)
     return cmd_enable(ap.parse_args(argv))

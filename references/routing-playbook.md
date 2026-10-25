@@ -45,19 +45,25 @@
 1. **已装本地能力**（`local_installed`，离线扫描本机已装 skill / 套件）——首选：离线、最快，本机已有的能力拿来就用、无需安装。注意本地层的对口判定比远端严（整词命中或 ≥2 个实词重合），弱相关的已装条目不会挡住远端；"做份简历"这类动词+核心词的检索词没命中本地属正常，落到远端找即可。
 2. **优质平台**（`quality_platform`，skill 技能平台 / hub）——本地没有对口的，才上网到这里找。
 3. **其他远端来源**（`other_remote`，如技能广场）——优质平台也没有时，再降一级。
-4. **通用工具**（`generic_tools`）——以上都没有对口项时，用通用工具（Bash / 文件工具 / 纯文本抓取 / 搜索等）兜底，并向用户说明这是通用路径而非专用能力。
+4. **SkillHub 开放社区**（`skillhub`，api.skillhub.cn 免鉴权检索 + `skillhub` CLI 安装）——不依赖宿主检索入口；宿主入口缺失或上述远端全部失败时，这层仍可触达远端并给出可安装候选。
+5. **通用工具**（`generic_tools`）——以上都没有对口项时，用通用工具（Bash / 文件工具 / 纯文本抓取 / 搜索等）兜底，并向用户说明这是通用路径而非专用能力。
 
 返回里的 `active_layer` 告诉你最终命中了哪一层，`layers` 里每层的 `status` / `kept` / `errors` 说明各层实际发生了什么；不要只看最终候选、忽略是哪一层给的。
 
-**命中平台候选后的安装：直接装，不停下来问人。** 用脚本的 `install` / `enable` 子命令非交互执行（`stdin` 关闭、不弹窗），参数就照候选里给出的 `install_hint` 原样传：
+**命中平台候选后的安装：先展示、确认后执行。** 先向用户展示候选的**来源、名称、版本、下载地址与哈希情况**并取得明确同意，然后两段式执行（候选里的 `install_hint` 是现成参数，已含版本）：
 
 ```bash
-python3 scripts/search_skill_platform.py install --slug <slug> --source hub --download-url "<url>"
-python3 scripts/search_skill_platform.py install --type plugin --plugin-code <code>
-python3 scripts/search_skill_platform.py enable  --slug <slug>
+# 1) 预览（默认行为）：策略校验 + 返回 confirm（来源/版本/下载地址/将执行的命令）
+python3 scripts/search_skill_platform.py install --slug <slug> --source hub --download-url "<url>" --version <v>
+# 2) 用户明确同意后，原命令加 --yes 才真正执行
+python3 scripts/search_skill_platform.py install --slug <slug> --source hub --download-url "<url>" --version <v> --yes
+# 重新启用：台账外（可能被用户有意禁用的）候选需 --user-confirmed
+python3 scripts/search_skill_platform.py enable --slug <slug> --yes
 ```
 
-这是面向小白用户的既定行为——**"要不要装"不归还给用户**。想先看一眼命令而不真装，加 `--dry-run`。退出码 `0` 表示安装/启用成功，`2` 表示失败或超时，失败时读 `error` 字段决定是换个候选还是退回上一层。
+策略由脚本强制：下载地址须过**域名白名单**且为 https（`SKILL_INSTALL_ALLOWED_HOSTS` 可配置）、**版本须固定**（缺失需用户知情加 `--allow-unpinned`）、提供 `--sha256` 时先下载校验再以本地文件安装、无哈希需 `--allow-no-hash` 知情豁免；`--force` 仅随确认生效；`enable` 不覆盖用户此前的禁用决定。退出码 `0` 表示跑通（预览也算），`2` 表示被策略拦下或安装失败/超时——策略拦下时读 `error` 字段，换候选或退回上一层。调用契约与审计入口见 `installer-contract.md`。
+
+**首次调用前披露数据范围。** 新装能力首次执行前，向用户说明它将接收哪些用户数据（对话内容、文件与路径、链接、可能的凭据等），用户有权拒绝；拒绝则不调用，改走通用工具或既有能力。披露只需一次，后续不重复盘问。
 
 **候选质量：**脚本默认已做**噪声过滤**——剔掉占位/测试名、纯数字纯符号名等无信息量条目，以及只靠"生成""工具""设计"等泛词蹭到的弱相关条目；过滤统计见 `filter` 字段。所以正常拿到的候选已经是清洗过的，直接判对口即可；想核对原始返回再加 `--no-filter`。
 
