@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 """自动加载技能（AutoSkill）的检索 / 安装入口（分层降级 + 噪声过滤 + 非交互安装）。
 
-分层降级链（按顺序，命中即停）：
-  1. 优质平台  quality_platform   —— skill 技能平台（skill hub）
-  2. 其他远端  other_remote       —— 技能广场（square）等远端来源
-  3. 已装本地  local_installed    —— 本机已安装的 skill / 套件（离线扫描）
+分层降级链（本地优先、网上补足；按顺序，命中即停）：
+  1. 已装本地  local_installed    —— 本机已安装的 skill / 套件（离线扫描，最快且不依赖网络）
+  2. 优质平台  quality_platform   —— skill 技能平台（skill hub）
+  3. 其他远端  other_remote       —— 技能广场（square）等远端来源
   4. 通用工具  generic_tools      —— 以上都没有时，交给通用工具兜底
 
 检索默认对候选做**噪声过滤**：剔除名称/标识无信息量（如纯数字、纯符号、占位名）的垃圾条目，
@@ -68,15 +68,15 @@ LAYER_LOCAL = "local_installed"
 LAYER_GENERIC = "generic_tools"
 
 LAYER_LABELS = {
+    LAYER_LOCAL: "已装本地能力",
     LAYER_QUALITY: "优质平台（skill 技能平台 / hub）",
     LAYER_REMOTE: "其他远端来源（技能广场等）",
-    LAYER_LOCAL: "已装本地能力",
     LAYER_GENERIC: "通用工具兜底",
 }
 FALLBACK_LEVEL = {
-    LAYER_QUALITY: 1,
-    LAYER_REMOTE: 2,
-    LAYER_LOCAL: 3,
+    LAYER_LOCAL: 1,
+    LAYER_QUALITY: 2,
+    LAYER_REMOTE: 3,
     LAYER_GENERIC: 4,
 }
 
@@ -444,7 +444,7 @@ def _read_frontmatter(path: Path) -> dict:
 
 
 def scan_local_layer() -> tuple[list[dict], dict]:
-    """离线扫描本机已安装的 skill 与套件，作为第 3 层候选。"""
+    """离线扫描本机已安装的 skill 与套件，作为第 1 层候选（本地优先）。"""
     items: list[dict] = []
     errors: dict[str, str] = {}
     seen: set[str] = set()
@@ -534,24 +534,6 @@ def run_search(queries: list[str], *, limit: int, top: int, do_filter: bool) -> 
         "ok": False,
     }
 
-    finder_path = locate_finder()
-    finder = None
-    runtime = None
-    finder_err = None
-    if finder_path is None:
-        finder_err = "未找到技能检索入口（extension_finder 脚本）；远端层不可用，仅本地层可用"
-    else:
-        try:
-            finder = load_finder(finder_path)
-            runtime = finder.detect_runtime()
-        except Exception as exc:  # noqa: BLE001
-            finder_err = f"检索入口加载失败: {exc}"
-    if finder_err:
-        result["errors"]["finder"] = finder_err
-        log(finder_err, level="warn")
-    else:
-        result["runtime"] = runtime
-
     def record_layer(name: str, *, status: str, items: list[dict], errors: dict, ok_jobs: int) -> bool:
         kept, dj, di = filter_and_score(items, queries, do_filter=do_filter)
         result["filter"]["raw"] += len(items)
@@ -579,7 +561,32 @@ def run_search(queries: list[str], *, limit: int, top: int, do_filter: bool) -> 
         result["layers"].append(entry)
         return bool(kept)
 
-    # 第 1 层：优质平台（skill hub）
+    # 第 1 层：已装本地能力（离线扫描——最快，不依赖网络与检索入口）
+    items, errors = scan_local_layer()
+    log(f"layer={LAYER_LOCAL} raw={len(items)} errors={len(errors)}")
+    if record_layer(LAYER_LOCAL, status="ok", items=items, errors=errors, ok_jobs=1):
+        return _finalize(result)
+
+    # 本地未命中，才加载远端检索入口（本地优先：本地命中时不触网、不加载入口）
+    finder_path = locate_finder()
+    finder = None
+    runtime = None
+    finder_err = None
+    if finder_path is None:
+        finder_err = "未找到技能检索入口（extension_finder 脚本）；远端层不可用"
+    else:
+        try:
+            finder = load_finder(finder_path)
+            runtime = finder.detect_runtime()
+        except Exception as exc:  # noqa: BLE001
+            finder_err = f"检索入口加载失败: {exc}"
+    if finder_err:
+        result["errors"]["finder"] = finder_err
+        log(finder_err, level="warn")
+    else:
+        result["runtime"] = runtime
+
+    # 第 2 层：优质平台（skill hub）
     if finder is not None:
         items, errors, ok_jobs = collect_remote_layer(
             finder, queries, runtime=runtime,
@@ -590,7 +597,7 @@ def run_search(queries: list[str], *, limit: int, top: int, do_filter: bool) -> 
         if record_layer(LAYER_QUALITY, status=status, items=items, errors=errors, ok_jobs=ok_jobs):
             return _finalize(result)
 
-    # 第 2 层：其他远端（广场 skill + 广场/插件来源）
+    # 第 3 层：其他远端（广场 skill + 广场/插件来源）
     if finder is not None and not result["candidates"]:
         is_ent = False
         try:
@@ -610,13 +617,6 @@ def run_search(queries: list[str], *, limit: int, top: int, do_filter: bool) -> 
         if record_layer(LAYER_REMOTE, status=status, items=items, errors=errors, ok_jobs=ok_jobs):
             return _finalize(result)
 
-    # 第 3 层：已装本地能力（离线扫描）
-    if not result["candidates"]:
-        items, errors = scan_local_layer()
-        log(f"layer={LAYER_LOCAL} raw={len(items)} errors={len(errors)}")
-        if record_layer(LAYER_LOCAL, status="ok", items=items, errors=errors, ok_jobs=1):
-            return _finalize(result)
-
     # 第 4 层：通用工具兜底（无候选，交由模型用通用工具）
     result["layers"].append({
         "layer": LAYER_GENERIC,
@@ -632,7 +632,7 @@ def run_search(queries: list[str], *, limit: int, top: int, do_filter: bool) -> 
 def _finalize(result: dict) -> dict:
     # 只要任意一层给出了可用结果（含 generic_tools 兜底），脚本就算跑通。
     result["ok"] = result["active_layer"] is not None
-    # 若所有远端层都失败、且本地层也没命中，仍然算跑通（进入通用兜底），但保留 errors 供上层判断。
+    # 若各层都没命中（本地与远端皆无），仍然算跑通（进入通用兜底），但保留 errors 供上层判断。
     return result
 
 
