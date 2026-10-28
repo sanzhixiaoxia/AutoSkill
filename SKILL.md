@@ -2,7 +2,7 @@
 name: AutoSkill
 slug: autoskill
 displayName: AutoSkill 自动加载技能
-version: 1.2.0
+version: 1.2.1
 summary: 只装这一个技能就够：每次请求自动判断要不要动用专门能力，本地已装优先、网上补足，按 已装本地→优质平台→其他远端→SkillHub→通用工具 逐层检索并直接加载执行；缺的能力先展示来源、版本、下载地址与哈希，经你确认后再装再用。
 license: MIT
 description: Automatically analyses each request and loads the capability that actually does the work instead of asking you which skill to use. Use it when you just say 帮我做X, when it is unclear which capability fits (该用什么技能、有没有现成的技能), or when you would rather not browse the skill ecosystem yourself. Installed local skills come first and remote sources fill the gap; a capability that is missing is shown with its source, version, download URL and hash, then installed or enabled only after you confirm it.

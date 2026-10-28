@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 scripts/.install-ledger.json
 tmp/
+# 图标位图由 assets/autoskill-icon.svg 渲染导出，本地留作商店上传，不入库
+assets/*.png
