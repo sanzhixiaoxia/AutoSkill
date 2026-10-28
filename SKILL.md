@@ -2,13 +2,10 @@
 name: AutoSkill
 slug: autoskill
 displayName: AutoSkill 自动加载技能
-version: 1.1.1
-summary: 只装这一个技能就够：自动分析对话意图，分层检索（本地优先、网上补足）并加载执行合适的能力，缺的能力先展示来源/版本/下载地址、经确认后安全安装。
+version: 1.2.0
+summary: 只装这一个技能就够：每次请求自动判断要不要动用专门能力，本地已装优先、网上补足，按 已装本地→优质平台→其他远端→SkillHub→通用工具 逐层检索并直接加载执行；缺的能力先展示来源、版本、下载地址与哈希，经你确认后再装再用。
 license: MIT
-description: >-
-  自动分析对话并加载执行所需技能。用户直接说"帮我做X"、不确定该用什么能力或技能、
-  不想在技能生态里挑拣时使用；每次请求自动判断要不要动用专门能力，本地已装优先、
-  网上补足，缺的能力先展示来源/版本/下载地址，经用户确认后安装。
+description: Automatically analyses each request and loads the capability that actually does the work instead of asking you which skill to use. Use it when you just say 帮我做X, when it is unclear which capability fits (该用什么技能、有没有现成的技能), or when you would rather not browse the skill ecosystem yourself. Installed local skills come first and remote sources fill the gap; a capability that is missing is shown with its source, version, download URL and hash, then installed or enabled only after you confirm it.
 compatibility: 依赖宿主提供的技能加载能力与"当前可用能力清单"注入；分层检索、噪声过滤与策略化安装（域名白名单、版本固定、哈希校验、确认后执行）依赖宿主已配置的能力发现入口（本环境为 extension-finder 脚本）与 python3。
 ---
 
